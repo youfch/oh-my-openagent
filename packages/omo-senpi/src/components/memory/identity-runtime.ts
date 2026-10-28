@@ -1,4 +1,4 @@
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 
 import {
   ReflectionReservationStore,
@@ -13,6 +13,7 @@ import type { ComponentLogger } from "../../extension/types"
 import { AGENT_DIR_ENV_NAMES, resolveAgentHome } from "../agent-home/resolve-agent-home"
 import type { SenpiOmoConfigResult } from "../config-resolution"
 import { ensureIdentityRuntimeDirs, type MemoryIdentityContext } from "./context"
+import { currentLaunchScope, withLaunchScope } from "./launch-facts"
 import { createReflectionRunIdFactory } from "./reflection-run-id"
 import { buildSandboxTransform, type SandboxPolicy, type SandboxTransform } from "./sandbox"
 import {
@@ -50,7 +51,7 @@ export interface MemoryIdentityRuntime {
   readonly reservationPort: ReflectionReservationPort
   readonly runner: SenpiSubprocessRunner
   launch(run: ReservedRun): Promise<void>
-  reconcile(): Promise<void>
+  reconcile(signal?: AbortSignal): Promise<void>
   /** Resolves once every launch started in this process has returned (a detached child may still be running). */
   settled(): Promise<void>
 }
@@ -113,6 +114,7 @@ export function createIdentityRuntime(
 
   const runner = new SenpiSubprocessRunner({
     identity: asMemoryIdentity(identity),
+    memoryRoot: dirname(dirname(identity.durableRoot)),
     reservation: store,
     logger: deps.logger,
     resolveModelRegistry: deps.resolveModelRegistry,
@@ -145,7 +147,14 @@ export function createIdentityRuntime(
     return runtimeDirsReady
   }
   const inFlight = new Set<Promise<void>>()
+  // Every launch runs in a scope bound to ITS run (launch-facts.ts): a trigger's own scope is kept
+  // when it is for this run; a queued follow-up or a reconcile gets a fresh scope of its own.
   const launch = (run: ReservedRun): Promise<void> => {
+    const scope = currentLaunchScope()
+    const owned = scope !== undefined && sameConversations(scope.conversationIds, run.request.conversationIds)
+    return owned ? launchInScope(run) : withLaunchScope({ conversationIds: run.request.conversationIds }, () => launchInScope(run))
+  }
+  const launchInScope = (run: ReservedRun): Promise<void> => {
     const tracked: Promise<void> = ensureRuntimeDirsOnce()
       .then(() => runner.launch(run))
       .then((result) => {
@@ -159,6 +168,7 @@ export function createIdentityRuntime(
     return tracked
   }
 
+  let reconciliation: { readonly promise: Promise<void>; readonly signal: AbortSignal | undefined } | undefined
   const runtime: MemoryIdentityRuntime = {
     identity,
     store,
@@ -168,13 +178,30 @@ export function createIdentityRuntime(
     async settled(): Promise<void> {
       while (inFlight.size > 0) await Promise.all([...inFlight])
     },
-    async reconcile(): Promise<void> {
-      await reconcileReflectionRuns({
-        identity: asMemoryIdentity(identity),
-        reservation: store,
-        launch,
-        deferOnSchedulerContention: true,
-      })
+    async reconcile(signal?: AbortSignal): Promise<void> {
+      // One identity-wide pass, including any already-admitted durable transition. Its first
+      // observer owns cancellation; an independent caller retries a foreign abort once.
+      // Never clear the flight on timeout alone: a committed transition may still be finishing.
+      for (let attempt = 0; ; attempt += 1) {
+        signal?.throwIfAborted()
+        const flight = reconciliation ??= {
+          signal,
+          promise: reconcileReflectionRuns({
+            identity: asMemoryIdentity(identity), reservation: store, launch,
+            deferOnSchedulerContention: true,
+            ...(signal === undefined ? {} : { signal }),
+          }).then(() => undefined).finally(() => { reconciliation = undefined }),
+        }
+        try {
+          await flight.promise
+        } catch (error) {
+          if (signal !== flight.signal) signal?.throwIfAborted()
+          if (attempt !== 0 || flight.signal === signal || !flight.signal?.aborted || error !== flight.signal.reason) throw error
+          continue
+        }
+        signal?.throwIfAborted()
+        return
+      }
     },
   }
   return runtime
@@ -189,6 +216,10 @@ export function createIdentityRuntime(
  */
 function pinnedAgentDirEnv(agentDir: string): NodeJS.ProcessEnv {
   return Object.fromEntries(AGENT_DIR_ENV_NAMES.map((name) => [name, agentDir]))
+}
+
+function sameConversations(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((id) => b.includes(id))
 }
 
 function describe(error: unknown): string {

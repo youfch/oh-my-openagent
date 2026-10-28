@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, spyOn, test } from "bun:test"
 import { existsSync, realpathSync, statSync } from "node:fs"
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -9,6 +9,7 @@ import { buildIdentityPaths } from "@oh-my-opencode/memory-core"
 import { resolveAgentHome } from "../agent-home/resolve-agent-home"
 import { createMemoryIdentityContext } from "./context"
 import { createIdentityRuntime } from "./identity-runtime"
+import { currentLaunchScope, withLaunchScope, type LaunchScope } from "./launch-facts"
 import { componentContext, loadedMemoryConfig, memorySettings } from "./memory.test-support"
 import type { ReflectionSandbox, ReflectionSpawnArgs } from "./worker"
 
@@ -16,6 +17,51 @@ const roots: string[] = []
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))))
 
 describe("memory identity runtime", () => {
+  test.each(["manual", "different", "aborted", "shared", "success", "failure"] as const)("#given overlapping identity observers (%s) #when the owner settles #then cancellation belongs to each caller", async (kind) => {
+    const root = await mkdtemp(join(tmpdir(), "omo-reconcile-flight-"))
+    roots.push(root)
+    const identity = createMemoryIdentityContext({
+      identity: "agent-test", identityPaths: buildIdentityPaths(root, "agent-test"),
+      binding: { identity: "agent-test", repoPathHash: "hash", boundAt: 1 },
+    })
+    const runtime = createIdentityRuntime(identity, {
+      loadConfig: () => loadedMemoryConfig(memorySettings()), cwd: () => root,
+      resolveModelRegistry: () => undefined,
+    })
+    const state = await runtime.store.readState()
+    const readState = runtime.store.readState.bind(runtime.store)
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<typeof state>()
+    const probe = spyOn(runtime.store, "readState").mockImplementationOnce(() => {
+      entered.resolve()
+      return release.promise
+    }).mockImplementation(readState)
+    const controller = new AbortController()
+    const joiner = new AbortController()
+    const reason = new DOMException("Settle observer budget exhausted", "TimeoutError")
+    const ownReason = new Error("joining observer retired")
+    const failure = new Error("reservation read failed")
+    const first = runtime.reconcile(controller.signal).catch((error: unknown) => error)
+    const second = runtime.reconcile(kind === "manual" ? undefined : kind === "shared" ? controller.signal : joiner.signal).catch((error: unknown) => error)
+    try {
+      await entered.promise
+      expect(probe).toHaveBeenCalledTimes(1)
+      if (kind === "aborted") joiner.abort(ownReason)
+      if (kind !== "success") controller.abort(reason)
+      if (kind === "failure") release.reject(failure)
+      else release.resolve(state)
+      expect(await first).toBe(kind === "success" ? undefined : kind === "failure" ? failure : reason)
+      expect(await second).toBe(kind === "shared" ? reason : kind === "aborted" ? ownReason : kind === "failure" ? failure : undefined)
+      expect(probe).toHaveBeenCalledTimes(kind === "manual" || kind === "different" ? 3 : kind === "success" ? 2 : 1)
+      probe.mockRestore()
+      await runtime.reconcile()
+    } finally {
+      release.resolve(state)
+      await Promise.all([first, second])
+      probe.mockRestore()
+    }
+  })
+
   test.skipIf(process.platform !== "darwin" && process.platform !== "linux")(
     "#given an unresolved reflection child command #when the real lazy sandbox is constructed #then the unsandboxed escape reaches the injected logger",
     async () => {
@@ -403,4 +449,66 @@ describe("memory identity runtime agent-dir resolution", () => {
     },
     30_000,
   )
+})
+
+describe("memory identity runtime binds every launch to its own run (#10339)", () => {
+  async function runtimeSeeingScopes(name: string): Promise<{ runtime: ReturnType<typeof createIdentityRuntime>; seen: (LaunchScope | undefined)[] }> {
+    const root = await mkdtemp(join(tmpdir(), `omo-memory-identity-runtime-scope-${name}-`))
+    roots.push(root)
+    const identity = createMemoryIdentityContext({
+      identity: name,
+      identityPaths: buildIdentityPaths(root, name),
+      binding: { identity: name, repoPathHash: "hash", boundAt: 1 },
+    })
+    const seen: (LaunchScope | undefined)[] = []
+    const runtime = createIdentityRuntime(identity, {
+      loadConfig: () => loadedMemoryConfig(memorySettings()),
+      cwd: () => root,
+      resolveModelRegistry: () => undefined,
+      // The runner resolves the session model at the start of every launch: record the scope it runs in.
+      resolveSessionModel: () => {
+        seen.push(currentLaunchScope())
+        return undefined
+      },
+      logger: componentContext().logger,
+    })
+    return { runtime, seen }
+  }
+
+  test("#given a reconcile-style launch with no trigger snapshot #when the runner resolves its facts #then it runs in a scope of its own run's conversations", async () => {
+    // given
+    const { runtime, seen } = await runtimeSeeingScopes("agent-scope-plain")
+    const reserved = await runtime.store.tryReserve({ trigger: "manual", conversationIds: ["conversation-a"], snapshots: [] })
+    if (reserved.status !== "active") throw new Error("expected an active manual reservation")
+
+    // when
+    await runtime.launch(reserved.run)
+
+    // then
+    expect(seen).toEqual([{ conversationIds: ["conversation-a"] }])
+  }, 30_000)
+
+  test("#given a launch for conversation A started inside session B's trigger scope #when the runner resolves its facts #then it never sees B's snapshot", async () => {
+    // given: B's trigger scope carries B's snapshot (a queued follow-up for A is launched from inside it)
+    const { runtime, seen } = await runtimeSeeingScopes("agent-scope-nested")
+    const reserved = await runtime.store.tryReserve({ trigger: "manual", conversationIds: ["conversation-a"], snapshots: [] })
+    if (reserved.status !== "active") throw new Error("expected an active manual reservation")
+    const sessionB = {
+      conversationIds: ["conversation-b"],
+      snapshot: {
+        modelRegistry: undefined,
+        sessionModel: { provider: "b", id: "b-model" },
+        parentContextTokens: 9,
+        parentSessionFile: "/B.jsonl",
+        parentCacheReusable: true,
+        agentDir: "/B",
+      },
+    }
+
+    // when
+    await withLaunchScope(sessionB, () => runtime.launch(reserved.run))
+
+    // then
+    expect(seen).toEqual([{ conversationIds: ["conversation-a"] }])
+  }, 30_000)
 })
